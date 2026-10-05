@@ -108,8 +108,9 @@ class GPT(nn.Module):
                              torch.triu(torch.ones(MAX_SEQ_LEN, MAX_SEQ_LEN, dtype=torch.bool),
                                         diagonal=1), persistent=False)
 
-    def forward(self, idx, targets=None, reduction="mean", chunk=512):
-        # Chunk along batch dim so peak memory stays bounded (lm_head logits dominate).
+    def forward(self, idx, targets=None, reduction="mean", chunk=8):
+        # Chunk along batch dim so peak memory stays bounded (lm_head logits dominate:
+        # B*T*V floats; on this 2 GB CPU box keep the chunk <= a few hundred MB).
         if idx.size(0) <= chunk:
             return self._forward(idx, targets, reduction)
         outs = [self._forward(idx[i:i + chunk],
@@ -145,7 +146,8 @@ LR = 3e-3               # AdamW learning rate
 WEIGHT_DECAY = 0.1
 WARMDOWN = 0.1          # linear decay over final 10% of the training slice
 
-EVAL_BATCH = 8          # rows per eval forward pass (logits: 8*2048*8192*4B = 0.5 GB)
+EVAL_BATCH = 8          # rows per eval dataloader step
+SELF_CHUNK = 4          # rows per eval forward pass (4*2048*8192*4B = 0.27 GB logits)
 EVAL_ROWS = EVAL_TOKENS // (EVAL_BATCH * MAX_SEQ_LEN)   # 1280 rows total
 # Interleaved train/eval schedule: the eval cost is unknown up front, so we
 # alternate train slices and eval pieces and re-plan after every piece using
@@ -241,7 +243,7 @@ while True:
             nb = xb.size(0)
             take = min(nb, target - rows_done)
             xk, yk = xb[:take], yb[:take]
-            loss_flat = model(xk, yk, reduction="none").view(-1)  # (take*T,)
+            loss_flat = model(xk, yk, reduction="none", chunk=SELF_CHUNK).view(-1)
             nbytes = token_bytes[yk.view(-1)]                     # (take*T,)
             mask = nbytes > 0
             total_nats += (loss_flat * mask).sum().item()
