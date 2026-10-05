@@ -149,9 +149,6 @@ WARMDOWN = 0.1          # linear decay over final 10% of the training slice
 EVAL_BATCH = 8          # rows per eval dataloader step
 SELF_CHUNK = 4          # rows per eval forward pass (4*2048*8192*4B = 0.27 GB logits)
 EVAL_ROWS = EVAL_TOKENS // (EVAL_BATCH * MAX_SEQ_LEN)   # 1280 rows total
-# Interleaved train/eval schedule: the eval cost is unknown up front, so we
-# alternate train slices and eval pieces and re-plan after every piece using
-# measured timings. Guarantees the run finishes inside the 300 s hard budget.
 # Schedule model: eval throughput measured at ~4.5 rows/s (~28 s per 128-row
 # piece). Full 1280-row eval costs ~290 s — incompatible with a 300 s run — so
 # we evaluate a PREFIX of the val stream (same locked bpb formula & loader
@@ -160,6 +157,25 @@ EVAL_PIECES = 5         # number of eval pieces
 PIECE_ROWS = 128        # rows per piece -> 640 eval rows (half of full 1280)
 TRAIN_END = 140.0       # stop training here; eval takes ~145 s after this
 FINISH_BY = 288.0       # hard self-deadline to print val_bpb before the 300 s wall
+# ---------------------------------------------------------------------------
+# Setup
+# ---------------------------------------------------------------------------
+
+t_start = time.time()
+
+tokenizer = Tokenizer.from_directory()
+vocab_size = tokenizer.get_vocab_size()
+print(f"Vocab size: {vocab_size:,}")
+
+cfg = GPTConfig(vocab_size=vocab_size, n_layer=N_LAYER, n_head=N_HEAD, n_embd=N_EMBD)
+print(f"Model config: {asdict(cfg)}")
+model = GPT(cfg)
+num_params = sum(p.numel() for p in model.parameters())
+print(f"num_params_M: {num_params / 1e6:.2f}")
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+train_loader = make_dataloader(tokenizer, BATCH, SEQ_LEN, "train")
+
 # ---------------------------------------------------------------------------
 # Main loop: train until TRAIN_END, then run the full prefix eval. Eval cost is
 # deterministic (~4.5 rows/s measured on this box; 640 rows ~= 145 s), so the
