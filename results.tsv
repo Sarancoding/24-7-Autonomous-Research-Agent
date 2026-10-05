@@ -1,1 +1,2 @@
 timestamp	commit	val_bpb	duration_s	status	notes
+2026-10-05T14:52Z	6fb7e28	-	300	timeout	iter3 verify run: reached eval row 640/1280 + step 600 at ~300s wall; no val_bpb printed. Schedule still slightly over-budget.

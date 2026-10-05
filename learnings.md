@@ -11,4 +11,7 @@
 - (to fill in)
 
 ## What doesn't
-- (to fill in)
+- Eval pieces of 128 rows cost ~30 s each on this box; with 1280 rows the schedule needs
+  ~300 s of pure eval — interleaved planner still lands at the wall. Next: shrink per-row
+  eval cost or reserve more end-of-run eval time (raise PIECE_FRAC / lower MIN_TRAIN_FRAC).
+- Verification run 2026-10-05T14:52Z timed out at 640/1280 eval rows (logged in results.tsv).
