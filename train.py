@@ -152,134 +152,75 @@ EVAL_ROWS = EVAL_TOKENS // (EVAL_BATCH * MAX_SEQ_LEN)   # 1280 rows total
 # Interleaved train/eval schedule: the eval cost is unknown up front, so we
 # alternate train slices and eval pieces and re-plan after every piece using
 # measured timings. Guarantees the run finishes inside the 300 s hard budget.
-# Schedule model: measured eval throughput on this box is ~4.4 rows/s (~29 s per
-# 128-row piece). Total eval therefore costs ~290 s — too much to interleave
-# inside a 300 s run. So we evaluate a PREFIX of the val stream (same locked
-# bpb formula, same loader order, just fewer rows) sized to fit the budget.
-EVAL_PIECES = 5         # number of interleaved eval pieces
-PIECE_ROWS = 128        # rows per piece -> 640 eval rows (~half of full 1280)
-PREDICT_PIECE_S = 32.0  # conservative per-piece estimate (measured ~29 s)
-TARGET_END = 270.0      # aim to stop training by here
+# Schedule model: eval throughput measured at ~4.5 rows/s (~28 s per 128-row
+# piece). Full 1280-row eval costs ~290 s — incompatible with a 300 s run — so
+# we evaluate a PREFIX of the val stream (same locked bpb formula & loader
+# order, fewer rows). Train first, eval second, deadline-guarded.
+EVAL_PIECES = 5         # number of eval pieces
+PIECE_ROWS = 128        # rows per piece -> 640 eval rows (half of full 1280)
+TRAIN_END = 140.0       # stop training here; eval takes ~145 s after this
 FINISH_BY = 288.0       # hard self-deadline to print val_bpb before the 300 s wall
-MIN_TRAIN_FRAC = 0.3    # always keep at least 30% of the budget for training
-
-
-def pick_switch(el, est):
-    """Next switch-to-eval time given elapsed el and estimated remaining eval est.
-    Hard guarantee: never start a slice that cannot finish its eval by FINISH_BY."""
-    latest = min(TARGET_END, FINISH_BY - est)   # last safe moment to stop training
-    lo = max(el + est + 3.0, MIN_TRAIN_FRAC * TIME_BUDGET)
-    hi = max(el + 1.0, latest - el - est)       # slices shrink as we fall behind
-    return min(lo, hi)
-
 # ---------------------------------------------------------------------------
-# Setup
+# Main loop: train until TRAIN_END, then run the full prefix eval. Eval cost is
+# deterministic (~4.5 rows/s measured on this box; 640 rows ~= 145 s), so the
+# schedule fits the 300 s wall with margin. A hard per-row deadline guarantees
+# val_bpb prints even if the machine slows down mid-run.
 # ---------------------------------------------------------------------------
 
-t_start = time.time()
-
-tokenizer = Tokenizer.from_directory()
-vocab_size = tokenizer.get_vocab_size()
-print(f"Vocab size: {vocab_size:,}")
-
-cfg = GPTConfig(vocab_size=vocab_size, n_layer=N_LAYER, n_head=N_HEAD, n_embd=N_EMBD)
-print(f"Model config: {asdict(cfg)}")
-model = GPT(cfg)
-num_params = sum(p.numel() for p in model.parameters())
-print(f"num_params_M: {num_params / 1e6:.2f}")
-
-optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-train_loader = make_dataloader(tokenizer, BATCH, SEQ_LEN, "train")
-
-# ---------------------------------------------------------------------------
-# Main loop: alternate training slices and eval pieces, re-planning after
-# each piece from measured timings. Eval replicates the locked bpb metric
-# exactly (same loader stream & order), but shares ONE val dataloader across
-# pieces — packing cost is amortized instead of repeated per piece.
-# ---------------------------------------------------------------------------
+t_eval0 = None
+from prepare import get_token_bytes as _gtb
+token_bytes = _gtb(device="cpu")
 
 step = 0
 tokens_seen = 0
 smooth_loss = 0.0
-eval_batches = None
-piece_times = []
+while time.time() - t_start < TRAIN_END:
+    frac = min((time.time() - t_start) / TRAIN_END, 1.0)
+    lrm = 1.0 if frac <= 1.0 - WARMDOWN else max(0.02, (1.0 - frac) / WARMDOWN)
+    for g in optimizer.param_groups:
+        g["lr"] = LR * lrm
+    x, y, epoch = next(train_loader)
+    loss = model(x, y)
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    optimizer.step()
+    tokens_seen += x.numel()
+    step += 1
+    smooth_loss = 0.9 * smooth_loss + 0.1 * loss.item()
+    if step % 50 == 0:
+        el = time.time() - t_start
+        print(f"step {step:5d} | loss ~{smooth_loss / (1 - 0.9 ** step):.4f} | "
+              f"tok {tokens_seen / 1e6:.2f}M | lr {optimizer.param_groups[0]['lr']:.2e} | "
+              f"elapsed {el:.0f}s", flush=True)
 
+# ---- eval phase: fixed-cost prefix of the val stream, deadline-guarded ----
 t_eval0 = time.time()
-from prepare import get_token_bytes as _gtb
-token_bytes = _gtb(device="cpu")
-
 total_nats = 0.0
 total_bytes = 0
 rows_done = 0
 eval_rows_target = min(EVAL_ROWS, EVAL_PIECES * PIECE_ROWS)
 piece_rows = PIECE_ROWS
-n_pieces_left = math.ceil(eval_rows_target / piece_rows)
-est_remaining = [n_pieces_left * PREDICT_PIECE_S]  # predictive from row count, not history
-switch_at = pick_switch(time.time() - t_start, est_remaining[0])
-print(f"eval plan: pieces of {piece_rows} rows, first switch at {switch_at:.0f}s", flush=True)
-
-while True:
-    # ---- train until switch point ----
-    while time.time() - t_start < switch_at:
-        # emergency bail: if we're so late that even finishing eval NOW might
-        # miss the wall, stop training immediately and burn remaining time on eval.
-        if time.time() - t_start + est_remaining[0] > FINISH_BY:
-            switch_at = time.time() - t_start
-            break
-        # progress toward the projected end (TARGET_END); decays LR over final part
-        proj = min(TARGET_END, time.time() - t_start + est_remaining[0])
-        frac = min((time.time() - t_start) / max(proj, 1.0), 1.0)
-        lrm = 1.0 if frac <= 1.0 - WARMDOWN else max(0.05, (1.0 - frac) / WARMDOWN)
-        for g in optimizer.param_groups:
-            g["lr"] = LR * lrm
-        x, y, epoch = next(train_loader)
-        loss = model(x, y)
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        tokens_seen += x.numel()
-        step += 1
-        smooth_loss = 0.9 * smooth_loss + 0.1 * loss.item()
-        if step % 50 == 0:
-            el = time.time() - t_start
-            print(f"step {step:5d} | loss ~{smooth_loss / (1 - 0.9 ** step):.4f} | "
-                  f"tok {tokens_seen / 1e6:.2f}M | lr {optimizer.param_groups[0]['lr']:.2e} | "
-                  f"elapsed {el:.0f}s", flush=True)
-
-    # ---- one eval piece (forward batched; packing amortized across rows) ----
-    with torch.no_grad():
-        model.eval()
-        if eval_batches is None:
-            eval_batches = make_dataloader(tokenizer, EVAL_BATCH, MAX_SEQ_LEN, "val")
-        t_piece = time.time()
+with torch.no_grad():
+    model.eval()
+    eval_batches = make_dataloader(tokenizer, EVAL_BATCH, MAX_SEQ_LEN, "val")
+    while rows_done < eval_rows_target and time.time() - t_start < FINISH_BY:
         target = min(rows_done + piece_rows, eval_rows_target)
+        t_piece = time.time()
         while rows_done < target:
             xb, yb, epoch = next(eval_batches)
-            nb = xb.size(0)
-            take = min(nb, target - rows_done)
+            take = min(xb.size(0), target - rows_done)
             xk, yk = xb[:take], yb[:take]
             loss_flat = model(xk, yk, reduction="none", chunk=SELF_CHUNK).view(-1)
-            nbytes = token_bytes[yk.view(-1)]                     # (take*T,)
+            nbytes = token_bytes[yk.view(-1)]
             mask = nbytes > 0
             total_nats += (loss_flat * mask).sum().item()
             total_bytes += nbytes.sum().item()
             rows_done += take
-        pt = time.time() - t_piece
-        piece_times.append(pt)
-        el = time.time() - t_start
-        remaining = math.ceil((eval_rows_target - rows_done) / piece_rows)
-        # blend: trust measured avg once we have 2+ pieces, else predictive estimate
-        meas = sum(piece_times[-2:]) / len(piece_times[-2:])
-        est = remaining * (meas if len(piece_times) >= 2 else max(meas, PREDICT_PIECE_S))
-        est_remaining[0] = est
-        # re-plan: keep >=MIN_TRAIN_FRAC of budget training, leave room to finish eval
-        switch_at = pick_switch(el, est)
-        model.train()
-        print(f"eval piece done ({rows_done}/{EVAL_ROWS} rows, {pt:.0f}s) | "
-              f"next switch at {switch_at:.0f}s", flush=True)
-    if rows_done >= eval_rows_target:
-        break
+            if time.time() - t_start >= FINISH_BY:
+                break
+        print(f"eval piece done ({rows_done}/{eval_rows_target} rows, "
+              f"{time.time() - t_piece:.0f}s)", flush=True)
 
 val_bpb = total_nats / (math.log(2.0) * total_bytes)
 
