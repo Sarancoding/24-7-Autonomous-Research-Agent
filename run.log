@@ -2,21 +2,26 @@ OpenBLAS WARNING - could not determine the L2 cache size on this system, assumin
 Vocab size: 8,192
 Model config: {'vocab_size': 8192, 'n_layer': 2, 'n_head': 4, 'n_embd': 96, 'rope_base': 10000.0}
 num_params_M: 1.79
-eval plan: pieces of 128 rows, first switch at 140s
-step    50 | loss ~7.2000 | tok 0.05M | lr 3.00e-03 | elapsed 15s
-step   100 | loss ~4.7376 | tok 0.10M | lr 3.00e-03 | elapsed 27s
-step   150 | loss ~2.9074 | tok 0.15M | lr 3.00e-03 | elapsed 39s
-step   200 | loss ~1.9946 | tok 0.20M | lr 3.00e-03 | elapsed 50s
-step   250 | loss ~1.3563 | tok 0.26M | lr 3.00e-03 | elapsed 62s
-step   300 | loss ~0.9635 | tok 0.31M | lr 3.00e-03 | elapsed 74s
-step   350 | loss ~0.7648 | tok 0.36M | lr 3.00e-03 | elapsed 86s
-step   400 | loss ~0.5139 | tok 0.41M | lr 3.00e-03 | elapsed 98s
-step   450 | loss ~0.3992 | tok 0.46M | lr 3.00e-03 | elapsed 110s
-step   500 | loss ~0.3115 | tok 0.51M | lr 3.00e-03 | elapsed 121s
-step   550 | loss ~0.2536 | tok 0.56M | lr 3.00e-03 | elapsed 133s
-eval piece done (128/1280 rows, 30s) | next switch at 171s
-eval piece done (256/1280 rows, 29s) | next switch at 201s
-eval piece done (384/1280 rows, 29s) | next switch at 232s
-eval piece done (512/1280 rows, 29s) | next switch at 262s
-step   600 | loss ~0.2001 | tok 0.61M | lr 2.43e-03 | elapsed 262s
-eval piece done (640/1280 rows, 31s) | next switch at 294s
+step    50 | loss ~7.2000 | tok 0.05M | lr 3.00e-03 | elapsed 14s
+step   100 | loss ~4.7376 | tok 0.10M | lr 3.00e-03 | elapsed 26s
+step   150 | loss ~2.9074 | tok 0.15M | lr 3.00e-03 | elapsed 38s
+step   200 | loss ~1.9946 | tok 0.20M | lr 3.00e-03 | elapsed 49s
+step   250 | loss ~1.3563 | tok 0.26M | lr 3.00e-03 | elapsed 61s
+step   300 | loss ~0.9635 | tok 0.31M | lr 3.00e-03 | elapsed 72s
+step   350 | loss ~0.7648 | tok 0.36M | lr 3.00e-03 | elapsed 84s
+step   400 | loss ~0.5139 | tok 0.41M | lr 3.00e-03 | elapsed 96s
+step   450 | loss ~0.3992 | tok 0.46M | lr 3.00e-03 | elapsed 108s
+step   500 | loss ~0.3115 | tok 0.51M | lr 3.00e-03 | elapsed 120s
+step   550 | loss ~0.2543 | tok 0.56M | lr 1.81e-03 | elapsed 132s
+eval piece done (128/640 rows, 30s)
+eval piece done (256/640 rows, 29s)
+eval piece done (384/640 rows, 29s)
+eval piece done (512/640 rows, 29s)
+eval piece done (640/640 rows, 29s)
+---
+val_bpb:        3.209035
+steps:          586
+train_tokens_M: 0.60
+eval_rows:      640/1280 (prefix eval)
+eval_s:         145.5
+duration_s:     285.7
