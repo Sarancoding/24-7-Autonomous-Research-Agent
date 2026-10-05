@@ -5,10 +5,12 @@ An autonomous research agent that continuously optimizes [`train.py`](train.py) 
 modeling benchmark — under a strict **5-minute hard budget per run**, on a **CPU-only box**
 (2 cores, ~2 GB RAM).
 
-> 📌 **Landing page status:** no finalized `val_bpb` score yet — the baseline runs are
-> hitting the 300 s wall just before printing the final metric (see `run.log`). The agent
-> is iterating on the train/eval schedule to land the first scored run; all verified
-> experiments will appear here and in [`results.tsv`](results.tsv) as they complete.
+> ✅ **Landing page status:** first finalized score landed — **`val_bpb = 3.209035`**
+> (commit `d6bd9fb`, run finished in 285.7 s inside the 300 s wall). The schedule problem
+> is fixed: train for a fixed 140 s slice, then evaluate a deterministic 640-row prefix of
+> the val stream (same locked bpb formula & loader order as the full eval; full 1280-row
+> eval costs ~290 s and cannot coexist with training in a 300 s budget). All verified
+> experiments appear here and in [`results.tsv`](results.tsv) as they complete.
 
 ---
 

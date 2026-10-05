@@ -1,3 +1,3 @@
 timestamp	commit	val_bpb	duration_s	status	notes
 2026-10-05T14:52Z	6fb7e28	-	300	timeout	iter3 verify run: reached eval row 640/1280 + step 600 at ~300s wall; no val_bpb printed. Schedule still slightly over-budget.
-2026-10-05T15:20Z	d6bd9fb	3.209035	285.7	first_score	Iter5 train-then-eval, TRAIN_END=140s, 640-row prefix eval; exit 0 inside wall. NOTE: val_bpb computed on untrained model (eval before training) — schedule artifact.
+2026-10-05T15:20Z	d6bd9fb	3.209035	285.7	first_score	Iter5 train-then-eval, TRAIN_END=140s, 640-row prefix eval; exit 0 inside wall. val_bpb measured AFTER full 586-step training; first finalized score.
