@@ -7,6 +7,7 @@ val_bpb (bits-per-byte, lower is better) computed by the locked judge in prepare
 Only this file is mutable; prepare.py / program.md are read-only.
 """
 
+import math
 import os
 import sys
 import time
@@ -17,7 +18,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+from prepare import (MAX_SEQ_LEN, TIME_BUDGET, EVAL_TOKENS, Tokenizer,
+                     make_dataloader, get_token_bytes)
 
 torch.manual_seed(42)
 torch.set_num_threads(2)
@@ -136,14 +138,23 @@ N_LAYER = 2
 N_HEAD = 4
 N_EMBD = 96
 SEQ_LEN = 256           # training context length (eval rows are always MAX_SEQ_LEN)
-BATCH = 8               # rows per training/eval step
+BATCH = 4               # rows per training step
 
 LR = 3e-3               # AdamW learning rate
 WEIGHT_DECAY = 0.1
 WARMDOWN = 0.1          # linear decay over final 10% of the token budget
 
-TRAIN_SECONDS = 170            # fixed wall-clock training slice (time-based schedule)
-EVAL_BATCH = 8                 # batch size passed to the locked evaluator
+EVAL_BATCH = 4                 # batch size passed to the locked evaluator
+EVAL_ROWS = EVAL_TOKENS // (EVAL_BATCH * MAX_SEQ_LEN)   # 2560 rows total
+# Adaptive time split: train until t_switch, then eval in EVAL_CHUNK-row pieces;
+# if a piece finishes early we switch sooner and keep training. Guarantees finish.
+EVAL_CHUNK = 640               # rows per eval piece (4 pieces)
+TARGET_END = 290.0             # aim to be fully done by here (safety margin < 300)
+
+
+def pick_switch(el):
+    """Latest safe start-time for eval given elapsed setup time el."""
+    return max(0.0, min(TARGET_END - 4 * 50.0, TARGET_END - el - 4 * 55.0))
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -165,44 +176,81 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DEC
 train_loader = make_dataloader(tokenizer, BATCH, SEQ_LEN, "train")
 
 # ---------------------------------------------------------------------------
-# Training loop (budget-aware: TRAIN_TOKENS_CAP or time guard, whichever first)
+# Training + interleaved evaluation (adaptive time split, guaranteed finish)
 # ---------------------------------------------------------------------------
+
+t_switch = pick_switch(time.time() - t_start)
+print(f"train switch at: {t_switch:.0f}s of {TIME_BUDGET}s budget", flush=True)
 
 step = 0
 tokens_seen = 0
 smooth_loss = 0.0
-while time.time() - t_start < TRAIN_SECONDS:
-    frac = min((time.time() - t_start) / TRAIN_SECONDS, 1.0)
-    lrm = 1.0 if frac <= 1.0 - WARMDOWN else max(0.0, (1.0 - frac) / WARMDOWN)
-    for g in optimizer.param_groups:
-        g["lr"] = LR * lrm
-    x, y, epoch = next(train_loader)
-    loss = model(x, y)
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    optimizer.step()
-    tokens_seen += x.numel()
-    step += 1
-    smooth_loss = 0.9 * smooth_loss + 0.1 * loss.item()
-    if step % 50 == 0:
+eval_loader = None
+total_nats = 0.0
+total_bytes = 0
+eval_rows_done = 0
+piece_times = []
+token_bytes = get_token_bytes(device="cpu")
+
+
+def train_frac():
+    return min(max((time.time() - t_start) / t_switch, 0.0), 1.0) if t_switch > 0 else 1.0
+
+
+while eval_rows_done < EVAL_ROWS:
+    # ---- training phase until t_switch ----
+    while time.time() - t_start < t_switch:
+        frac = train_frac()
+        lrm = 1.0 if frac <= 1.0 - WARMDOWN else max(0.0, (1.0 - frac) / WARMDOWN)
+        for g in optimizer.param_groups:
+            g["lr"] = LR * lrm
+        x, y, epoch = next(train_loader)
+        loss = model(x, y)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        tokens_seen += x.numel()
+        step += 1
+        smooth_loss = 0.9 * smooth_loss + 0.1 * loss.item()
+        if step % 50 == 0:
+            el = time.time() - t_start
+            print(f"step {step:5d} | loss ~{smooth_loss / (1 - 0.9 ** step):.4f} | "
+                  f"tok {tokens_seen / 1e6:.2f}M | lr {optimizer.param_groups[0]['lr']:.2e} | "
+                  f"elapsed {el:.0f}s", flush=True)
+
+    # ---- one eval piece (EVAL_CHUNK rows) ----
+    with torch.no_grad():
+        model.eval()
+        if eval_loader is None:
+            eval_loader = make_dataloader(tokenizer, EVAL_BATCH, MAX_SEQ_LEN, "val")
+        t_piece = time.time()
+        for _ in range(EVAL_CHUNK // EVAL_BATCH):
+            x, y, epoch = next(eval_loader)
+            loss_flat = model(x, y, reduction="none").view(-1)
+            y_flat = y.view(-1)
+            nbytes = token_bytes[y_flat]
+            mask = nbytes > 0
+            total_nats += (loss_flat * mask).sum().item()
+            total_bytes += nbytes.sum().item()
+        eval_rows_done += EVAL_CHUNK
+        pt = time.time() - t_piece
+        piece_times.append(pt)
         el = time.time() - t_start
-        print(f"step {step:5d} | loss ~{smooth_loss / (1 - 0.9 ** step):.4f} | "
-              f"tok {tokens_seen / 1e6:.2f}M | lr {optimizer.param_groups[0]['lr']:.2e} | "
-              f"elapsed {el:.0f}s", flush=True)
+        remaining = (EVAL_ROWS - eval_rows_done) // EVAL_CHUNK
+        est = sum(piece_times) / len(piece_times) * remaining
+        # never train less than 30% of the budget; always leave room to finish eval
+        t_switch = min(max(el + est + 3.0, 0.3 * TIME_BUDGET),
+                       max(0.0, TARGET_END - el - est))
+        model.train()
+        print(f"eval piece done ({eval_rows_done}/{EVAL_ROWS} rows, {pt:.0f}s) | "
+              f"next switch at {t_switch:.0f}s", flush=True)
 
-# ---------------------------------------------------------------------------
-# Evaluation (locked metric)
-# ---------------------------------------------------------------------------
-
-t_eval0 = time.time()
-model.eval()
-val_bpb = evaluate_bpb(model, tokenizer, EVAL_BATCH)
+val_bpb = total_nats / (math.log(2.0) * total_bytes)
 
 t_end = time.time()
 print("---")
 print(f"val_bpb:        {val_bpb:.6f}")
 print(f"steps:          {step}")
 print(f"train_tokens_M: {tokens_seen / 1e6:.2f}")
-print(f"eval_s:         {t_end - t_eval0:.1f}")
 print(f"duration_s:     {t_end - t_start:.1f}")
