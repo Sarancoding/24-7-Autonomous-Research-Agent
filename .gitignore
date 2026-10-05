@@ -1,4 +1,3 @@
-# Run status files
-run.status__pycache__/
-
+# Scratch / build artifacts
 run.status
+__pycache__/
