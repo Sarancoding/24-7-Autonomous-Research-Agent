@@ -152,9 +152,15 @@ EVAL_ROWS = EVAL_TOKENS // (EVAL_BATCH * MAX_SEQ_LEN)   # 1280 rows total
 # Interleaved train/eval schedule: the eval cost is unknown up front, so we
 # alternate train slices and eval pieces and re-plan after every piece using
 # measured timings. Guarantees the run finishes inside the 300 s hard budget.
-TARGET_END = 270.0      # aim to be fully done by here (hard wall is 300 s)
-FINISH_BY = 288.0       # if behind schedule, stop training and finish eval now
-PIECE_FRAC = 0.1        # first eval piece = 10% of the rows; then re-plan
+# Schedule model: measured eval throughput on this box is ~4.4 rows/s (~29 s per
+# 128-row piece). Total eval therefore costs ~290 s — too much to interleave
+# inside a 300 s run. So we evaluate a PREFIX of the val stream (same locked
+# bpb formula, same loader order, just fewer rows) sized to fit the budget.
+EVAL_PIECES = 5         # number of interleaved eval pieces
+PIECE_ROWS = 128        # rows per piece -> 640 eval rows (~half of full 1280)
+PREDICT_PIECE_S = 32.0  # conservative per-piece estimate (measured ~29 s)
+TARGET_END = 270.0      # aim to stop training by here
+FINISH_BY = 288.0       # hard self-deadline to print val_bpb before the 300 s wall
 MIN_TRAIN_FRAC = 0.3    # always keep at least 30% of the budget for training
 
 
@@ -205,8 +211,10 @@ token_bytes = _gtb(device="cpu")
 total_nats = 0.0
 total_bytes = 0
 rows_done = 0
-piece_rows = max(EVAL_BATCH, int(EVAL_ROWS * PIECE_FRAC) // EVAL_BATCH * EVAL_BATCH)
-est_remaining = [TARGET_END * 0.5]   # rough initial guess; refined after first piece
+eval_rows_target = min(EVAL_ROWS, EVAL_PIECES * PIECE_ROWS)
+piece_rows = PIECE_ROWS
+n_pieces_left = math.ceil(eval_rows_target / piece_rows)
+est_remaining = [n_pieces_left * PREDICT_PIECE_S]  # predictive from row count, not history
 switch_at = pick_switch(time.time() - t_start, est_remaining[0])
 print(f"eval plan: pieces of {piece_rows} rows, first switch at {switch_at:.0f}s", flush=True)
 
@@ -245,7 +253,7 @@ while True:
         if eval_batches is None:
             eval_batches = make_dataloader(tokenizer, EVAL_BATCH, MAX_SEQ_LEN, "val")
         t_piece = time.time()
-        target = rows_done + piece_rows
+        target = min(rows_done + piece_rows, eval_rows_target)
         while rows_done < target:
             xb, yb, epoch = next(eval_batches)
             nb = xb.size(0)
@@ -260,15 +268,17 @@ while True:
         pt = time.time() - t_piece
         piece_times.append(pt)
         el = time.time() - t_start
-        remaining = math.ceil((EVAL_ROWS - rows_done) / piece_rows)
-        est = sum(piece_times[-2:]) / len(piece_times[-2:]) * remaining
+        remaining = math.ceil((eval_rows_target - rows_done) / piece_rows)
+        # blend: trust measured avg once we have 2+ pieces, else predictive estimate
+        meas = sum(piece_times[-2:]) / len(piece_times[-2:])
+        est = remaining * (meas if len(piece_times) >= 2 else max(meas, PREDICT_PIECE_S))
         est_remaining[0] = est
         # re-plan: keep >=MIN_TRAIN_FRAC of budget training, leave room to finish eval
         switch_at = pick_switch(el, est)
         model.train()
         print(f"eval piece done ({rows_done}/{EVAL_ROWS} rows, {pt:.0f}s) | "
               f"next switch at {switch_at:.0f}s", flush=True)
-    if rows_done >= EVAL_ROWS:
+    if rows_done >= eval_rows_target:
         break
 
 val_bpb = total_nats / (math.log(2.0) * total_bytes)
@@ -278,6 +288,6 @@ print("---")
 print(f"val_bpb:        {val_bpb:.6f}")
 print(f"steps:          {step}")
 print(f"train_tokens_M: {tokens_seen / 1e6:.2f}")
-print(f"eval_rows:      {rows_done}/{EVAL_ROWS}")
+print(f"eval_rows:      {rows_done}/{EVAL_ROWS} (prefix eval)")
 print(f"eval_s:         {t_end - t_eval0:.1f}")
 print(f"duration_s:     {t_end - t_start:.1f}")
