@@ -241,8 +241,8 @@ while True:
             nb = xb.size(0)
             take = min(nb, target - rows_done)
             xk, yk = xb[:take], yb[:take]
-            loss_flat = model(xk, yk, reduction="none")   # (take, T)
-            nbytes = token_bytes[yk]                      # (take, T)
+            loss_flat = model(xk, yk, reduction="none").view(-1)  # (take*T,)
+            nbytes = token_bytes[yk.view(-1)]                     # (take*T,)
             mask = nbytes > 0
             total_nats += (loss_flat * mask).sum().item()
             total_bytes += nbytes.sum().item()
