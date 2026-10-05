@@ -105,10 +105,23 @@ class GPT(nn.Module):
                              torch.triu(torch.ones(MAX_SEQ_LEN, MAX_SEQ_LEN, dtype=torch.bool),
                                         diagonal=1), persistent=False)
 
-    def forward(self, idx, targets=None, reduction="mean"):
+    def forward(self, idx, targets=None, reduction="mean", chunk=512):
+        # Chunk along batch dim so peak memory stays bounded (lm_head logits dominate).
+        if idx.size(0) <= chunk:
+            return self._forward(idx, targets, reduction)
+        outs = [self._forward(idx[i:i + chunk],
+                              None if targets is None else targets[i:i + chunk], reduction)
+                for i in range(0, idx.size(0), chunk)]
+        if reduction == "none":
+            return torch.cat(outs, 0)
+        return sum(o * o.new_tensor(s) for o, s in zip(outs, [idx[i:i + chunk].numel()
+                        for i in range(0, idx.size(0), chunk)])) / idx.numel()
+
+    def _forward(self, idx, targets, reduction):
+        T = idx.size(1)
         x = self.wte(idx)
         for block in self.blocks:
-            x = block(x, self.rot_cos, self.rot_sin, self.causal_mask)
+            x = block(x, self.rot_cos[:T], self.rot_sin[:T], self.causal_mask)
         logits = self.lm_head(norm(x))
         if targets is None:
             return logits
@@ -121,17 +134,16 @@ class GPT(nn.Module):
 
 N_LAYER = 2
 N_HEAD = 4
-N_EMBD = 128
+N_EMBD = 96
 SEQ_LEN = 256           # training context length (eval rows are always MAX_SEQ_LEN)
-BATCH = 16              # rows per training step
+BATCH = 8               # rows per training/eval step
 
 LR = 3e-3               # AdamW learning rate
 WEIGHT_DECAY = 0.1
 WARMDOWN = 0.1          # linear decay over final 10% of the token budget
 
-TRAIN_TOKENS_CAP = 500_000     # ~120s of training at ~4.7 ktok/s on this box
-EVAL_RESERVE_S = 170           # stop training by TIME_BUDGET - reserve
-EVAL_BATCH = 16                # batch size passed to the locked evaluator
+TRAIN_SECONDS = 170            # fixed wall-clock training slice (time-based schedule)
+EVAL_BATCH = 8                 # batch size passed to the locked evaluator
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -159,13 +171,11 @@ train_loader = make_dataloader(tokenizer, BATCH, SEQ_LEN, "train")
 step = 0
 tokens_seen = 0
 smooth_loss = 0.0
-while tokens_seen < TRAIN_TOKENS_CAP:
-    if time.time() - t_start > TIME_BUDGET - EVAL_RESERVE_S:
-        print("time guard tripped, stopping training early")
-        break
-    frac = min(tokens_seen / TRAIN_TOKENS_CAP, 1.0)
+while time.time() - t_start < TRAIN_SECONDS:
+    frac = min((time.time() - t_start) / TRAIN_SECONDS, 1.0)
+    lrm = 1.0 if frac <= 1.0 - WARMDOWN else max(0.0, (1.0 - frac) / WARMDOWN)
     for g in optimizer.param_groups:
-        g["lr"] = LR * max(0.0, (1.0 - frac) / WARMDOWN if frac > 1.0 - WARMDOWN else 1.0)
+        g["lr"] = LR * lrm
     x, y, epoch = next(train_loader)
     loss = model(x, y)
     optimizer.zero_grad(set_to_none=True)
