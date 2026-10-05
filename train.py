@@ -123,14 +123,15 @@ N_LAYER = 2
 N_HEAD = 4
 N_EMBD = 128
 SEQ_LEN = 256           # training context length (eval rows are always MAX_SEQ_LEN)
-BATCH = 4               # rows per training step
+BATCH = 16              # rows per training step
 
-LR = 3e-4               # AdamW learning rate
+LR = 3e-3               # AdamW learning rate
 WEIGHT_DECAY = 0.1
+WARMDOWN = 0.1          # linear decay over final 10% of the token budget
 
-TRAIN_TOKENS_CAP = 3_000_000   # stop training early to leave time for eval on CPU
-EVAL_RESERVE_S = 150           # reserve wall-clock seconds for evaluation
-EVAL_BATCH = 4                 # batch size passed to the locked evaluator
+TRAIN_TOKENS_CAP = 500_000     # ~120s of training at ~4.7 ktok/s on this box
+EVAL_RESERVE_S = 170           # stop training by TIME_BUDGET - reserve
+EVAL_BATCH = 16                # batch size passed to the locked evaluator
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -162,6 +163,9 @@ while tokens_seen < TRAIN_TOKENS_CAP:
     if time.time() - t_start > TIME_BUDGET - EVAL_RESERVE_S:
         print("time guard tripped, stopping training early")
         break
+    frac = min(tokens_seen / TRAIN_TOKENS_CAP, 1.0)
+    for g in optimizer.param_groups:
+        g["lr"] = LR * max(0.0, (1.0 - frac) / WARMDOWN if frac > 1.0 - WARMDOWN else 1.0)
     x, y, epoch = next(train_loader)
     loss = model(x, y)
     optimizer.zero_grad(set_to_none=True)
@@ -171,15 +175,17 @@ while tokens_seen < TRAIN_TOKENS_CAP:
     tokens_seen += x.numel()
     step += 1
     smooth_loss = 0.9 * smooth_loss + 0.1 * loss.item()
-    if step % 200 == 0:
+    if step % 50 == 0:
         el = time.time() - t_start
         print(f"step {step:5d} | loss ~{smooth_loss / (1 - 0.9 ** step):.4f} | "
-              f"tok {tokens_seen / 1e6:.2f}M | elapsed {el:.0f}s", flush=True)
+              f"tok {tokens_seen / 1e6:.2f}M | lr {optimizer.param_groups[0]['lr']:.2e} | "
+              f"elapsed {el:.0f}s", flush=True)
 
 # ---------------------------------------------------------------------------
 # Evaluation (locked metric)
 # ---------------------------------------------------------------------------
 
+t_eval0 = time.time()
 model.eval()
 val_bpb = evaluate_bpb(model, tokenizer, EVAL_BATCH)
 
@@ -188,4 +194,5 @@ print("---")
 print(f"val_bpb:        {val_bpb:.6f}")
 print(f"steps:          {step}")
 print(f"train_tokens_M: {tokens_seen / 1e6:.2f}")
+print(f"eval_s:         {t_end - t_eval0:.1f}")
 print(f"duration_s:     {t_end - t_start:.1f}")
