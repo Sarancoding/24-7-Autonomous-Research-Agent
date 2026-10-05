@@ -152,15 +152,18 @@ EVAL_ROWS = EVAL_TOKENS // (EVAL_BATCH * MAX_SEQ_LEN)   # 1280 rows total
 # Interleaved train/eval schedule: the eval cost is unknown up front, so we
 # alternate train slices and eval pieces and re-plan after every piece using
 # measured timings. Guarantees the run finishes inside the 300 s hard budget.
-TARGET_END = 285.0      # aim to be fully done by here
+TARGET_END = 270.0      # aim to be fully done by here (hard wall is 300 s)
+FINISH_BY = 288.0       # if behind schedule, stop training and finish eval now
 PIECE_FRAC = 0.1        # first eval piece = 10% of the rows; then re-plan
 MIN_TRAIN_FRAC = 0.3    # always keep at least 30% of the budget for training
 
 
 def pick_switch(el, est):
-    """Next switch-to-eval time given elapsed el and estimated remaining eval est."""
+    """Next switch-to-eval time given elapsed el and estimated remaining eval est.
+    Hard guarantee: never start a slice that cannot finish its eval by FINISH_BY."""
+    latest = min(TARGET_END, FINISH_BY - est)   # last safe moment to stop training
     lo = max(el + est + 3.0, MIN_TRAIN_FRAC * TIME_BUDGET)
-    hi = max(el + 1.0, TARGET_END - el - est)
+    hi = max(el + 1.0, latest - el - est)       # slices shrink as we fall behind
     return min(lo, hi)
 
 # ---------------------------------------------------------------------------
@@ -210,6 +213,11 @@ print(f"eval plan: pieces of {piece_rows} rows, first switch at {switch_at:.0f}s
 while True:
     # ---- train until switch point ----
     while time.time() - t_start < switch_at:
+        # emergency bail: if we're so late that even finishing eval NOW might
+        # miss the wall, stop training immediately and burn remaining time on eval.
+        if time.time() - t_start + est_remaining[0] > FINISH_BY:
+            switch_at = time.time() - t_start
+            break
         # progress toward the projected end (TARGET_END); decays LR over final part
         proj = min(TARGET_END, time.time() - t_start + est_remaining[0])
         frac = min((time.time() - t_start) / max(proj, 1.0), 1.0)
