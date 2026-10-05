@@ -1,0 +1,4 @@
+#!/bin/sh
+# uv shim: this environment ships plain python3. `uv run X args...` -> `python3 X args...`
+if [ "$1" = "run" ]; then shift; fi
+exec python3 "$@"
